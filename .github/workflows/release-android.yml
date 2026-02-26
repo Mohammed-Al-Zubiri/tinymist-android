@@ -193,7 +193,12 @@ jobs:
 
       - name: Build tinymist
         env:
-          RUSTFLAGS: "-C strip=none"
+          # 16 KB page alignment (-z max-page-size=16384) produces ELF binaries
+          # compatible with both 4 KB page kernels (Android <15) and 16 KB page
+          # kernels (Android 15+ on devices like Pixel 9). The only cost is a
+          # few KB of padding. This is backward-compatible because 16 KB is a
+          # multiple of 4 KB.
+          RUSTFLAGS: "-C strip=none -C link-arg=-z -C link-arg=max-page-size=16384"
         run: |
           cargo build \
             --release \
@@ -204,7 +209,7 @@ jobs:
         id: typlite
         continue-on-error: true
         env:
-          RUSTFLAGS: "-C strip=none"
+          RUSTFLAGS: "-C strip=none -C link-arg=-z -C link-arg=max-page-size=16384"
         run: |
           cargo build \
             --release \

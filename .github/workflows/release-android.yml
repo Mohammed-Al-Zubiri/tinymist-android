@@ -98,13 +98,9 @@ jobs:
             cc_env: CC_x86_64_linux_android
             cxx_env: CXX_x86_64_linux_android
             arch_label: x86_64
-          - target: i686-linux-android
-            linker: i686-linux-android21-clang
-            cc: i686-linux-android21-clang
-            cxx: i686-linux-android21-clang++
-            cc_env: CC_i686_linux_android
-            cxx_env: CXX_i686_linux_android
-            arch_label: x86
+          # i686-linux-android is excluded: the upstream reflexo crate has
+          # compile-time assertions requiring 8-byte alignment for rkyv archived
+          # types, which fails on 32-bit x86 (4-byte pointer alignment).
 
     steps:
       - name: Checkout at tag
@@ -314,7 +310,8 @@ jobs:
           | \`tinymist-${TAG}-aarch64-linux-android.tar.gz\` | ARM64 | arm64-v8a |
           | \`tinymist-${TAG}-armv7-linux-androideabi.tar.gz\` | ARMv7 | armeabi-v7a |
           | \`tinymist-${TAG}-x86_64-linux-android.tar.gz\` | x86_64 | x86_64 |
-          | \`tinymist-${TAG}-i686-linux-android.tar.gz\` | x86 | x86 |
+
+          > **Note:** 32-bit x86 (i686) is not supported due to alignment constraints in the upstream \`reflexo\` crate.
 
           ### Binaries included
 

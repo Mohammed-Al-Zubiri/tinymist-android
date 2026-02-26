@@ -1,0 +1,309 @@
+name: Release Android
+
+on:
+  schedule:
+    # Run daily at 06:30 UTC (30 min after sync to allow it to complete)
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (e.g. v0.14.10). Leave empty to auto-detect latest unbuilt tag."
+        required: false
+        type: string
+      force:
+        description: "Force rebuild even if a release already exists for this tag"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  detect-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag to build
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+            echo "Using manually specified tag: $TAG"
+          else
+            # Find the latest stable version tag (vX.Y.Z, no pre-release suffix)
+            TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | head -1)
+
+            if [[ -z "$TAG" ]]; then
+              echo "No stable version tags found."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Latest stable tag: $TAG"
+          fi
+
+          # Check if a release already exists for this tag on the fork
+          if [[ "$INPUT_FORCE" != "true" ]]; then
+            if gh release view "$TAG" &>/dev/null; then
+              echo "Release $TAG already exists. Skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Will build tag: $TAG"
+
+  build:
+    needs: detect-tag
+    if: needs.detect-tag.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            linker: aarch64-linux-android21-clang
+            arch_label: arm64-v8a
+          - target: armv7-linux-androideabi
+            linker: armv7a-linux-androideabi21-clang
+            arch_label: armeabi-v7a
+          - target: x86_64-linux-android
+            linker: x86_64-linux-android21-clang
+            arch_label: x86_64
+          - target: i686-linux-android
+            linker: i686-linux-android21-clang
+            arch_label: x86
+
+    steps:
+      - name: Checkout at tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.detect-tag.outputs.tag }}
+
+      - name: Patch out battery feature
+        run: |
+          echo "Disabling battery feature for Android compatibility..."
+
+          # crates/tinymist-cli/Cargo.toml:
+          #   1. Comment out "battery" from default features list
+          #   2. Comment out battery feature definition
+          sed -i 's/^    "battery",$/    # "battery",/' crates/tinymist-cli/Cargo.toml
+          sed -i 's/^battery = \["tinymist\/battery"\]$/# battery = ["tinymist\/battery"]/' crates/tinymist-cli/Cargo.toml
+
+          # crates/tinymist-std/Cargo.toml:
+          #   1. Comment out battery optional dependency
+          #   2. Comment out battery feature definition
+          sed -i 's/^battery = { workspace = true, optional = true }$/# battery = { workspace = true, optional = true }/' crates/tinymist-std/Cargo.toml
+          sed -i 's/^battery = \["dep:battery"\]$/# battery = ["dep:battery"]/' crates/tinymist-std/Cargo.toml
+
+          # crates/tinymist/Cargo.toml:
+          #   1. Comment out battery feature definition
+          sed -i 's/^battery = \["tinymist-std\/battery"\]$/# battery = ["tinymist-std\/battery"]/' crates/tinymist/Cargo.toml
+
+          echo "--- Verifying patches ---"
+          echo "tinymist-cli/Cargo.toml:"
+          grep -n 'battery' crates/tinymist-cli/Cargo.toml || true
+          echo ""
+          echo "tinymist-std/Cargo.toml:"
+          grep -n 'battery' crates/tinymist-std/Cargo.toml || true
+          echo ""
+          echo "tinymist/Cargo.toml:"
+          grep -n 'battery' crates/tinymist/Cargo.toml || true
+
+          # Verify all battery lines are commented out (except comments/docs)
+          UNCOMMENTED=$(grep -rn '^battery\|^    "battery"' \
+            crates/tinymist-cli/Cargo.toml \
+            crates/tinymist-std/Cargo.toml \
+            crates/tinymist/Cargo.toml || true)
+
+          if [[ -n "$UNCOMMENTED" ]]; then
+            echo "::error::Battery feature was not fully patched out!"
+            echo "$UNCOMMENTED"
+            exit 1
+          fi
+
+          echo "Battery feature successfully disabled."
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Android target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager "ndk;26.3.11579264"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/ndk/26.3.11579264/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Cargo for Android
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << EOF
+          [target.${{ matrix.target }}]
+          linker = "${{ matrix.linker }}"
+          ar = "llvm-ar"
+          EOF
+          echo "--- .cargo/config.toml ---"
+          cat .cargo/config.toml
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build tinymist
+        env:
+          RUSTFLAGS: "-C strip=none"
+        run: |
+          cargo build \
+            --release \
+            --target ${{ matrix.target }} \
+            -p tinymist-cli
+
+      - name: Build typlite (best-effort)
+        id: typlite
+        continue-on-error: true
+        env:
+          RUSTFLAGS: "-C strip=none"
+        run: |
+          cargo build \
+            --release \
+            --target ${{ matrix.target }} \
+            -p typlite
+
+      - name: Strip binaries
+        run: |
+          STRIP_TOOL="llvm-strip"
+
+          $STRIP_TOOL target/${{ matrix.target }}/release/tinymist
+
+          if [[ -f target/${{ matrix.target }}/release/typlite ]]; then
+            $STRIP_TOOL target/${{ matrix.target }}/release/typlite
+          fi
+
+      - name: Package artifacts
+        id: package
+        run: |
+          TAG="${{ needs.detect-tag.outputs.tag }}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE_NAME="tinymist-${TAG}-${TARGET}"
+          ARCHIVE_DIR="dist/${ARCHIVE_NAME}"
+
+          mkdir -p "$ARCHIVE_DIR"
+          cp target/${TARGET}/release/tinymist "$ARCHIVE_DIR/"
+
+          if [[ -f target/${TARGET}/release/typlite ]]; then
+            cp target/${TARGET}/release/typlite "$ARCHIVE_DIR/"
+            echo "typlite=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "typlite=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          cd dist
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          cd ..
+
+          echo "archive=dist/${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${ARCHIVE_NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+
+          echo "--- Package contents ---"
+          ls -lh "$ARCHIVE_DIR/"
+          echo ""
+          echo "--- Archive ---"
+          ls -lh "dist/${ARCHIVE_NAME}.tar.gz"
+          cat "dist/${ARCHIVE_NAME}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive_name }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          retention-days: 7
+
+  release:
+    needs: [detect-tag, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        id: assets
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -exec cp {} release/ \;
+          echo "--- Release assets ---"
+          ls -lh release/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.detect-tag.outputs.tag }}
+        run: |
+          UPSTREAM_URL="https://github.com/Myriad-Dreamin/tinymist/releases/tag/${TAG}"
+
+          gh release create "$TAG" release/* \
+            --title "tinymist ${TAG} (Android)" \
+            --notes "$(cat <<EOF
+          ## Android builds for tinymist ${TAG}
+
+          These are Android cross-compiled builds of [tinymist ${TAG}](${UPSTREAM_URL}).
+
+          ### Changes from upstream
+
+          - The \`battery\` feature is disabled (the \`battery\` crate does not support Android).
+            This only affects the \`syntaxOnly: "onPowerSaving"\` config option, which will
+            log a warning instead of detecting battery state.
+
+          ### Available targets
+
+          | Archive | Architecture | Android ABI |
+          |---------|-------------|-------------|
+          | \`tinymist-${TAG}-aarch64-linux-android.tar.gz\` | ARM64 | arm64-v8a |
+          | \`tinymist-${TAG}-armv7-linux-androideabi.tar.gz\` | ARMv7 | armeabi-v7a |
+          | \`tinymist-${TAG}-x86_64-linux-android.tar.gz\` | x86_64 | x86_64 |
+          | \`tinymist-${TAG}-i686-linux-android.tar.gz\` | x86 | x86 |
+
+          ### Binaries included
+
+          - **tinymist** - Integrated language service for Typst (LSP server + CLI)
+          - **typlite** - Typst to Markdown converter (if build succeeded)
+
+          ### Usage
+
+          These binaries are built for Android API level 21+ (Android 5.0 Lollipop and later).
+          They can be used in Termux, or invoked as a subprocess from an Android application.
+
+          ---
+
+          *Built automatically from upstream [Myriad-Dreamin/tinymist](https://github.com/Myriad-Dreamin/tinymist).*
+          EOF
+          )"

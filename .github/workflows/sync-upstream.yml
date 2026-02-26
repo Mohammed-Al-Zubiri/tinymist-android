@@ -1,0 +1,49 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # Full history needed for merge and tag detection
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          if ! git remote get-url upstream &>/dev/null; then
+            git remote add upstream https://github.com/Myriad-Dreamin/tinymist.git
+          fi
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream main --tags --force
+
+      - name: Merge upstream/main
+        run: |
+          git merge upstream/main --no-edit --ff-only || {
+            echo "::warning::Fast-forward merge failed. Upstream may have diverged."
+            echo "Attempting regular merge..."
+            git merge upstream/main --no-edit --strategy-option theirs
+          }
+
+      - name: Push changes and tags
+        run: |
+          git push origin main --tags

@@ -44,6 +44,50 @@ jobs:
             git merge upstream/main --no-edit --strategy-option theirs
           }
 
+      - name: Revert upstream workflow files
+        # Prevent upstream workflows from being added to the fork. GitHub rejects
+        # pushes that attempt to create / update workflow files when the runner
+        # (a GitHub App) does not have the `workflows` permission. To avoid that
+        # problem we explicitly remove any upstream-added workflow files and
+        # restore the fork's allowed workflows before pushing.
+        run: |
+          echo "Ensuring only allowed workflow files are present..."
+
+          # Allowed workflow filenames to keep on the fork
+          ALLOWED=("release-android.yml" "sync-upstream.yml")
+
+          # Ensure origin/main is available to restore our versions if needed
+          git fetch origin main --depth=1 || true
+
+          # If .github/workflows exists, remove any files not in ALLOWED
+          if [ -d .github/workflows ]; then
+            for f in .github/workflows/*; do
+              [ -e "${f}" ] || continue
+              base=$(basename "${f}")
+              keep=false
+              for a in "${ALLOWED[@]}"; do
+                if [ "${base}" = "${a}" ]; then
+                  keep=true
+                  break
+                fi
+              done
+              if [ "$keep" = false ]; then
+                git rm -f --ignore-unmatch "${f}" || true
+              fi
+            done
+          fi
+
+          # Restore our allowed workflow files from origin/main if they're missing
+          for a in "${ALLOWED[@]}"; do
+            if [ ! -f ".github/workflows/${a}" ]; then
+              git checkout origin/main -- .github/workflows/${a} || true
+            fi
+          done
+
+          # Stage and commit any changes to workflow files (if any)
+          git add -A .github/workflows || true
+          git commit -m "ci(sync): keep fork workflows and remove upstream workflows" || echo "No workflow changes to commit"
+
       - name: Push changes and tags
         run: |
           git push origin main --tags
